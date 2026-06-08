@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-cn">
+<head>
+    <meta charset="UTF-8">
+    <title>植物识别·最终诊断</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.js"></script>
+    <style>
+        body { font-family: monospace; margin: 15px; background: #1e1e1e; color: #ddd; }
+        .card { background: #2d2d2d; padding: 15px; margin: 10px 0; border-radius: 6px; }
+        .ok { color: #8f8; }
+        .err { color: #f66; }
+        .info { color: #aaa; }
+        #preview { max-width: 300px; display: none; margin: 10px 0; border: 2px solid #555; }
+        h2 { color: #fff; }
+        button { padding: 5px 10px; }
+    </style>
+</head>
+<body>
+    <h2>🌱 植物识别诊断</h2>
+    <div id="status" class="info">🔌 连接MQTT中...</div>
+    <img id="preview" />
+    <div id="log"></div>
+
+    <script>
+        const API_KEY = "tegtmHDT5OTz2B72Q13kQvaN";
+        const SECRET_KEY = "ulIgQ46kEGWV3cmxn9fULmJc3XkfzUUu";
+        const TOPIC = "plantimg_7906a8e58";
+        const BROKER = "ws://broker.emqx.io:8083/mqtt";
+
+        const client = new Paho.MQTT.Client(BROKER, "diag_" + Math.random().toString(16).slice(2,10));
+        const logDiv = document.getElementById('log');
+        const statusDiv = document.getElementById('status');
+        const previewImg = document.getElementById('preview');
+
+        function log(msg, cls='info') {
+            logDiv.innerHTML += `<div class="${cls}">${msg}</div>`;
+        }
+
+        client.onConnectionLost = () => {
+            log('🔴 MQTT 断开，5秒后重连', 'err');
+            statusDiv.innerHTML = '🔴 断开';
+            setTimeout(connect, 5000);
+        };
+
+        client.onMessageArrived = (msg) => {
+            if (msg.destinationName === TOPIC) {
+                try {
+                    const data = JSON.parse(msg.payloadString);
+                    if (data.url) {
+                        previewImg.src = data.url;
+                        previewImg.style.display = 'block';
+                        statusDiv.innerHTML = '📸 开始识别...';
+                        log(`✅ 收到图片URL: ${data.url}`, 'ok');
+                        diagnose(data.url);
+                    } else {
+                        log(`❌ JSON 中没有 url 字段: ${msg.payloadString}`, 'err');
+                    }
+                } catch(e) {
+                    log(`❌ JSON解析失败: ${e.message}`, 'err');
+                }
+            }
+        };
+
+        function connect() {
+            client.connect({
+                onSuccess: () => {
+                    log('✅ MQTT 连接成功', 'ok');
+                    statusDiv.innerHTML = '🟢 已连接，等待拍照...';
+                    client.subscribe(TOPIC);
+                },
+                onFailure: (err) => {
+                    log(`❌ MQTT 连接失败: ${err.errorMessage}`, 'err');
+                }
+            });
+        }
+
+        // ---------- 诊断主流程 ----------
+        async function diagnose(imgUrl) {
+            logDiv.innerHTML = '';  // 清屏
+            log(`🔍 诊断开始，图片: ${imgUrl}`);
+
+            // 1. 获取 token
+            log(`⏳ 1/2 获取百度 access_token...`);
+            try {
+                const tokenUrl = `https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=${API_KEY}&client_secret=${SECRET_KEY}`;
+                const tokenResp = await fetch(tokenUrl, { method: 'POST' });
+                const tokenText = await tokenResp.text();
+                let tokenData;
+                try { tokenData = JSON.parse(tokenText); } catch(e) {
+                    log(`❌ token 响应不是合法 JSON: ${tokenText.substring(0, 200)}`, 'err');
+                    statusDiv.innerHTML = '❌ token 解析失败';
+                    return;
+                }
+                log(`🔑  token 响应: ${tokenText}`, tokenData.access_token ? 'ok' : 'err');
+                if (!tokenData.access_token) {
+                    log(`❌ 未获得 access_token`, 'err');
+                    statusDiv.innerHTML = '❌ token 无效';
+                    return;
+                }
+                const token = tokenData.access_token;
+                log(`✅ 获得 token: ${token.substring(0, 30)}...`, 'ok');
+
+                // 2. 调用植物识别
+                log(`⏳ 2/2 调用植物识别接口...`);
+                const apiUrl = `https://aip.baidubce.com/rest/2.0/image-classify/v1/plant?access_token=${token}`;
+                const body = `url=${encodeURIComponent(imgUrl)}`;
+                const recogResp = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/x-www-form-urlencoded','Accept':'application/json'},
+                    body: body
+                });
+                const recogStatus = recogResp.status;
+                const recogText = await recogResp.text();
+                log(`🌐  HTTP 状态码: ${recogStatus}`, recogStatus === 200 ? 'ok' : 'err');
+                log(`📄  原始响应: ${recogText}`);
+
+                let recogData;
+                try { recogData = JSON.parse(recogText); } catch(e) {
+                    log(`❌ 识别响应不是合法 JSON`, 'err');
+                    statusDiv.innerHTML = '❌ 响应格式错误';
+                    return;
+                }
+
+                if (recogData.error_code) {
+                    log(`❌ 百度 API 错误码: ${recogData.error_code}`, 'err');
+                    log(`❌ 错误信息: ${recogData.error_msg || '无'}`, 'err');
+                    statusDiv.innerHTML = `❌ 错误 ${recogData.error_code}`;
+                } else {
+                    log(`✅ 识别成功！`, 'ok');
+                    statusDiv.innerHTML = '✅ 识别完成';
+                    // 显示结果
+                    let html = '<h3>识别结果：</h3><ul>';
+                    if (recogData.result) {
+                        recogData.result.forEach(r => html += `<li><b>${r.name}</b>（${(r.score*100).toFixed(1)}%）</li>`);
+                    } else {
+                        html += '<li>未识别出植物</li>';
+                    }
+                    html += '</ul>';
+                    logDiv.innerHTML += html;
+                }
+            } catch (netErr) {
+                log(`❌ 网络异常: ${netErr.message}`, 'err');
+                statusDiv.innerHTML = '❌ 网络错误';
+            }
+        }
+
+        connect();
+    </script>
+</body>
+</html>
